@@ -1,0 +1,525 @@
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h>
+#include <Adafruit_Sensor.h>
+#include <Adafruit_TCS34725.h>
+#include <ADS1115_WE.h>
+#include <PZEM004Tv30.h>
+#include <SoftwareSerial.h>
+
+// Initialize two LCD objects with their respective I2C addresses
+LiquidCrystal_I2C lcd1(0x27, 20, 4);  // LCD 1: Address 0x27, 20 columns, 4 rows
+LiquidCrystal_I2C lcd2(0x26, 20, 4);  // LCD 2: Address 0x26, 20 columns, 4 rows
+
+Adafruit_TCS34725 tcs = Adafruit_TCS34725(TCS34725_INTEGRATIONTIME_600MS, TCS34725_GAIN_1X);
+
+#define GY302_ADDRESS 0x23
+// I2C address for ADS1115
+#define I2C_ADDRESS 0x48
+
+// Create an ADS1115 object
+ADS1115_WE adc = ADS1115_WE(I2C_ADDRESS);
+
+// Commands for GY-302
+#define POWER_ON 0x01
+#define RESET 0x07
+#define CONTINUOUS_H_RES_MODE 0x10
+
+#define PZEM_RX_PIN 12
+#define PZEM_TX_PIN 13
+
+#define trig 9
+#define echo 10
+
+SoftwareSerial pzemSWSerial(PZEM_RX_PIN, PZEM_TX_PIN);
+PZEM004Tv30 pzem(pzemSWSerial);
+
+int stepPin = 5;       // Motor 1 Step Pin arm a1
+int directionPin = 4;  // Motor 1 Direction Pin arm
+int stpPin = 3;        // Motor 2 Step Pin light a2
+int dirctionPin = 2;
+const int sensorPin = A0;
+const int relayPin = 8;
+
+const int stepDelay = 500;
+
+float responsivity = 0.5;  // V/W·m² from datasheet for ir
+float Maxtemperature = 65.0;
+const float uvScaleFactor = 307;      // Typically, 1 V equals 307 mW/m² of UV intensity
+const float uvToIndexFactor = 0.05;   // Conversion factor from mW/m² to UV index
+const float temp_coefficient = 10.0;  // LM35 temperature sensor scale: 10 mV/°C
+
+const float b = 0.0003;   // Half the width of the light source (in meters)
+const float l = 0.00025;  // Height of the light source (in meters)
+
+float luxon[30];
+float luxvalue[30];
+float luxoff[30];
+float luxavgon[30];
+float difflux[30];
+float powera[10];
+float avguvindex = 0.0;
+float avglux = 0.0;
+float avguvon = 0.0;
+float avgiron = 0.0;
+float diffir = 0.0;
+float diffuv = 0.0;
+float poweravg = 0.0;
+float flux = 0.0;
+float efficacy = 0.0;
+float fluxarea = 0.3299674;
+float avgiron2 = 0.0;
+float avguvon2 = 0.0;
+
+float readAngle() {
+  int sensorValue = analogRead(sensorPin);
+  float angle = map(sensorValue, 0, 1023, 0, 360);
+  return angle;
+}
+
+void stepMotor(bool clockwise) {
+  digitalWrite(directionPin, clockwise ? HIGH : LOW);
+  digitalWrite(stepPin, HIGH);
+  delayMicroseconds(stepDelay);
+  digitalWrite(stepPin, LOW);
+  delayMicroseconds(stepDelay);
+}
+
+void setup() {
+  Serial.begin(9600);
+  Wire.begin();
+
+  pinMode(stepPin, OUTPUT);
+  pinMode(directionPin, OUTPUT);
+  pinMode(stpPin, OUTPUT);
+  pinMode(dirctionPin, OUTPUT);
+  pinMode(sensorPin, INPUT);
+  pinMode(trig, OUTPUT);
+  pinMode(echo, INPUT);
+  pinMode(relayPin, OUTPUT);
+
+  Wire.beginTransmission(GY302_ADDRESS);
+  Wire.write(POWER_ON);  // Power on
+  Wire.endTransmission();
+  Wire.beginTransmission(GY302_ADDRESS);
+  Wire.write(CONTINUOUS_H_RES_MODE);  // Set to continuous high-resolution mode
+  Wire.endTransmission();
+
+  adc.setVoltageRange_mV(ADS1115_RANGE_6144);
+  adc.setCompareChannels(ADS1115_COMP_0_GND);  // Set the first channel to read IR intensity
+  adc.setMeasureMode(ADS1115_CONTINUOUS);
+
+  float angle = 20.0;
+
+  float targetAngle = 325.0;
+  float currentAngle = readAngle();
+  {
+    // Initialize both LCDs with the correct dimensions
+    lcd1.begin(20, 4);
+    lcd2.begin(20, 4);
+
+    // Turn on the backlight for both
+    lcd1.backlight();
+    lcd2.backlight();
+
+    // Write messages to each LCD
+    lcd1.setCursor(0, 0);  // Set cursor to column 0, row 0 on LCD 1
+    lcd1.print("LUMINIZERR");
+
+    lcd2.setCursor(0, 0);  // Set cursor to column 0, row 0 on LCD 2
+    lcd2.print("Group 08");
+  }
+
+  digitalWrite(relayPin, LOW);
+  delay(500);
+  while (int(currentAngle) != int(targetAngle)) {
+    currentAngle = readAngle();
+
+    if (currentAngle < targetAngle) {
+      stepMotor(false);  // Move
+    } else if (currentAngle > targetAngle) {
+      stepMotor(true);  // Move clockwise true
+    }
+  }
+  delay(500);
+  for (int i = 0; i < 30; i++) {
+
+    uint16_t gy302_luxoff = readGY302();
+    luxoff[i] = gy302_luxoff;
+
+    digitalWrite(directionPin, HIGH);
+    for (float stepCount = 1; stepCount <= 88.89; stepCount++) {
+      digitalWrite(stepPin, HIGH);
+      delayMicroseconds(500);
+      
+      digitalWrite(stepPin, LOW);
+      delayMicroseconds(500);
+    }
+    delay(500);
+  }
+
+  delay(1000);
+
+  digitalWrite(directionPin, LOW);
+  for (float stepCount = 1; stepCount <= 1321.83; stepCount++) {
+    digitalWrite(stepPin, HIGH);
+    delayMicroseconds(500);
+    digitalWrite(stepPin, LOW);
+    delayMicroseconds(500);
+  }
+
+  delay(500);
+
+  int16_t rawUVoff = readChannel(ADS1115_COMP_2_GND);
+  float uvVoltageoff = rawUVoff * 0.076295 / 1000.0;  //v
+                                                      // Convert the voltage to UV intensity (mW/m²)
+  float uvIntensityoff = uvVoltageoff * uvScaleFactor / 1000;
+  // Convert UV intensity to UV index
+
+  int16_t rawIRoff = readChannel(ADS1115_COMP_0_GND);
+  float irVoltageoff = rawIRoff * 0.076295 / 1000.0;  //v
+  float IR_intensityoff = irVoltageoff / responsivity;
+
+  Serial.print("  IR_intensityoff: ");
+  Serial.print(IR_intensityoff);
+  Serial.println();
+  Serial.print("  uv_intensityoff: ");
+  Serial.print(uvIntensityoff);
+  Serial.println();
+
+  delay(500);
+
+  digitalWrite(directionPin, LOW);
+  for (float stepCount = 1; stepCount <= 1321.83; stepCount++) {
+    digitalWrite(stepPin, HIGH);
+    delayMicroseconds(500);
+    digitalWrite(stepPin, LOW);
+    delayMicroseconds(500);
+  }
+
+  while (int(currentAngle) != int(targetAngle)) {
+    currentAngle = readAngle();
+
+    if (currentAngle < targetAngle) {
+      stepMotor(false);  // Move
+    } else if (currentAngle > targetAngle) {
+      stepMotor(true);  // Move clockwise true
+    }
+  }
+  delay(500);
+  digitalWrite(relayPin, HIGH);
+
+  delay(50);
+  for (int i = 0; i < 10; i++) {
+
+    delay(500);
+
+    for (int i = 0; i < 30; i++) {
+      luxon[i] = 0.0;
+      // --- GY-302 Readings ---
+      uint16_t gy302_lux = readGY302();
+
+      luxon[i] = gy302_lux;
+      luxvalue[i] += luxon[i];
+
+      delay(100);
+
+      int16_t rawTemp = readChannel(ADS1115_COMP_1_GND);          // Read raw value from temperature channel
+      float voltageTemp = rawTemp;                                // The raw value is already in millivolts (mV)
+      float temperatureC = voltageTemp * 1.0 / temp_coefficient;  // Convert mV to temperature (°C)
+
+      if (temperatureC > 65) {
+        digitalWrite(relayPin, LOW);
+        return;
+      }
+
+      angle += 10.0;
+      lcd2.clear();
+      lcd2.setCursor(0, 0);
+      lcd2.print("Angle: ");
+      lcd2.print(angle);
+      lcd2.setCursor(0, 1);
+      lcd2.print("Illuminance:");
+      lcd2.print(gy302_lux);
+      lcd2.print(" Lux");
+      lcd1.setCursor(5, 1);  // Set cursor to column 0, row 0 on LCD 2
+      lcd1.print("Group 08");
+
+      digitalWrite(directionPin, HIGH);
+      for (float stepCount = 1; stepCount <= 88.89; stepCount++) {
+        digitalWrite(stepPin, HIGH);
+        delayMicroseconds(500);
+        digitalWrite(stepPin, LOW);
+        delayMicroseconds(500);
+      }
+      delay(500);
+    }
+    angle = 20.0;
+
+    delay(500);
+
+    digitalWrite(dirctionPin, HIGH);
+    for (float stpCount = 1; stpCount <= 160.0; stpCount++) {
+      digitalWrite(stpPin, HIGH);
+      delayMicroseconds(500);
+      digitalWrite(stpPin, LOW);
+      delayMicroseconds(500);
+    }
+
+    float voltage = pzem.voltage();
+    float current = pzem.current();
+    float power = pzem.power();
+    float energy = pzem.energy();
+    float frequency = pzem.frequency();
+    float pf = pzem.pf();
+    powera[i] = power;
+
+    poweravg += powera[i] / 10;
+
+    Serial.print("Voltage: ");
+    Serial.print(voltage);
+    Serial.println("V");
+    Serial.print("Current: ");
+    Serial.print(current);
+    Serial.println("A");
+    Serial.print("Power: ");
+    Serial.print(poweravg);
+    Serial.println("W");
+    Serial.print("Energy: ");
+    Serial.print(energy, 3);
+    Serial.println("kWh");
+    Serial.print("Frequency: ");
+    Serial.print(frequency, 1);
+    Serial.println("Hz");
+    Serial.print("PF: ");
+    Serial.println(pf);
+
+    Serial.println();
+
+    delay(500);
+    digitalWrite(directionPin, LOW);
+    for (float stepCount = 1; stepCount <= 2643.67; stepCount++) {
+      digitalWrite(stepPin, HIGH);
+      delayMicroseconds(500);
+      digitalWrite(stepPin, LOW);
+      delayMicroseconds(500);
+    }
+  }
+  digitalWrite(dirctionPin, LOW);
+  for (float stpCount = 1; stpCount <= 1600.0; stpCount++) {
+    digitalWrite(stpPin, HIGH);
+    delayMicroseconds(500);
+    digitalWrite(stpPin, LOW);
+    delayMicroseconds(500);
+  }
+  delay(500);
+  digitalWrite(directionPin, HIGH);
+  for (float stepCount = 1; stepCount <= 1333.33; stepCount++) {
+    digitalWrite(stepPin, HIGH);
+    delayMicroseconds(500);
+    digitalWrite(stepPin, LOW);
+    delayMicroseconds(500);
+  }
+
+
+
+  delay(500);
+
+  uint16_t red, green, blue, clear;
+  uint16_t colorTemp, lux;
+
+  // Get the raw data from the sensor
+  tcs.getRawData(&red, &green, &blue, &clear);
+
+  // Calculate RGB values normalized by the clear channel (ambient light intensity)
+  float r = red / (float)clear * 255.0;
+  float g = green / (float)clear * 255.0;
+  float b = blue / (float)clear * 255.0;
+
+  // Calculate color temperature (Kelvin) and lux
+  colorTemp = tcs.calculateColorTemperature_dn40(red, green, blue, clear);
+
+
+
+  Serial.print("  Red: ");
+  Serial.print((int)r);
+  Serial.print("  Green: ");
+  Serial.print((int)g);
+  Serial.print("  Blue: ");
+  Serial.print((int)b);
+  Serial.print("  Color Temp: ");
+  Serial.print(colorTemp);
+  Serial.print(" K");
+  Serial.println();
+
+  digitalWrite(trig, LOW);
+  delayMicroseconds(2);
+  digitalWrite(trig, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(trig, LOW);
+
+  long t = pulseIn(echo, HIGH, 30000);
+  long inches = t / 74 / 2;
+  float cm = t / 29 / 2;
+  float meters = (cm / 100.0) - 0.01;
+
+  Serial.print(meters, 2);  // Print meters with 2 decimal places
+  Serial.println(" m");
+
+  int16_t rawUV = readChannel(ADS1115_COMP_2_GND);
+  float uvVoltage = rawUV * 0.076295 / 1000.0;  //v
+                                                // Convert the voltage to UV intensity (mW/m²)
+  float uvIntensityon = uvVoltage * uvScaleFactor / 1000;
+  // Convert UV intensity to UV index
+
+  Serial.print("  uvIntensity: ");
+  Serial.print(uvIntensityon);
+  Serial.println();
+  Serial.print("  uvIndex: ");
+  Serial.println();
+
+  int16_t rawIR = readChannel(ADS1115_COMP_0_GND);
+  float irVoltage = rawIR * 0.076295 / 1000.0;  //v
+  float IR_intensityon = irVoltage / responsivity;
+
+  Serial.print("  IR_intensity: ");
+  Serial.print(IR_intensityon);
+  Serial.println();
+
+  for (int i = 0; i < 30; i++) {
+
+    luxavgon[i] = luxvalue[i] / 10;
+
+    Serial.print("  LUXavg: ");
+    Serial.print(luxavgon[i]);
+    Serial.println();
+
+    difflux[i] = luxavgon[i] - luxoff[i];
+    avglux += difflux[i] / 30;
+  }
+
+  diffir = IR_intensityon - IR_intensityoff;
+  diffuv = uvIntensityon - uvIntensityoff;
+
+  avguvindex = diffuv * uvToIndexFactor * 1000;
+
+  // Calculate intermediate values
+  float denominatorPart = (l * b) / (4 * meters * meters);
+
+  // Ensure denominatorPart is within the range of asin() [-1, 1]
+  if (denominatorPart > 1) denominatorPart = 1;
+  if (denominatorPart < -1) denominatorPart = -1;
+
+  float denominator = 4 * asin(denominatorPart);
+
+  float light_intensity = (avglux * l * b) / denominator;
+  flux = avglux * fluxarea;
+
+  efficacy = flux / poweravg;
+
+  digitalWrite(relayPin, LOW);
+  delay(1000);
+
+  while (true) {
+    lcd2.clear();
+    lcd2.setCursor(0, 0);
+    lcd2.print("Light Intensity ");
+    lcd2.setCursor(0, 1);
+    lcd2.print(light_intensity);
+    lcd2.print(" cd");
+    lcd1.clear();
+    lcd1.setCursor(0, 0);
+    lcd1.print("Illuminance ");
+    lcd1.setCursor(5, 1);
+    lcd1.print(avglux);
+    lcd1.print(" Lux");
+    delay(3000);
+
+    lcd1.clear();
+    lcd1.setCursor(0, 0);
+    lcd1.print("UV Index ");
+    lcd1.setCursor(5, 1);
+    lcd1.print(avguvindex);
+    lcd1.print(" ");
+    delay(3000);
+
+    lcd1.clear();
+    lcd1.setCursor(0, 0);
+    lcd1.print("IR Intensity ");
+    lcd1.setCursor(5, 1);
+    lcd1.print(diffir);
+    lcd1.print("W/m");
+    delay(3000);
+
+    lcd1.clear();
+    lcd1.setCursor(0, 0);
+    lcd1.print("Luminous Flux ");
+    lcd1.setCursor(5, 1);
+    lcd1.print(flux);
+    lcd1.print(" lm");
+    delay(1500);
+    lcd2.clear();
+    lcd2.setCursor(0, 0);
+    lcd2.print("Efficacy ");
+    lcd2.setCursor(5, 1);
+    lcd2.print(efficacy);
+    lcd2.print(" lm/W");
+    delay(1500);
+
+    lcd1.clear();
+    lcd1.setCursor(0, 0);
+    lcd1.print("Power of lamp ");
+    lcd1.setCursor(5, 1);
+    lcd1.print(poweravg);
+    lcd1.print(" W");
+    delay(3000);
+
+    lcd1.clear();
+    lcd1.setCursor(0, 0);
+    lcd1.print("R: ");
+    lcd1.setCursor(2, 0);
+    lcd1.print((int)r, DEC);
+    lcd1.print(" ");
+    lcd1.setCursor(7, 0);
+    lcd1.print("G: ");
+    lcd1.setCursor(9, 0);
+    lcd1.print((int)g, DEC);
+    lcd1.print(" ");
+    lcd1.setCursor(0, 1);
+    lcd1.print("B: ");
+    lcd1.setCursor(2, 1);
+    lcd1.print((int)b, DEC);
+    lcd1.print(" ");
+    delay(3000);
+
+    lcd1.clear();
+    lcd1.setCursor(0, 0);
+    lcd1.print("Color Temp: ");
+    lcd1.setCursor(5, 1);
+    lcd1.print(colorTemp);
+    lcd1.print(" K ");
+    delay(3000);
+  }
+}
+
+void loop() {
+}
+
+// Function to read lux value from GY-302
+uint16_t readGY302() {
+  uint16_t lux = 0;
+  Wire.beginTransmission(GY302_ADDRESS);
+  Wire.requestFrom(GY302_ADDRESS, 2);
+  if (Wire.available() == 2) {
+    lux = Wire.read();
+    lux <<= 8;
+    lux |= Wire.read();
+    lux /= 1.2;  // Convert to lux
+  }
+  Wire.endTransmission();
+  return lux;
+}
+// Function to read a specific channel of the ADS1115
+int16_t readChannel(ADS1115_MUX channel) {
+  adc.setCompareChannels(channel);  // Set the channel to read from
+  return adc.getResult_mV();        // Return voltage in millivolts (mV)
+}
